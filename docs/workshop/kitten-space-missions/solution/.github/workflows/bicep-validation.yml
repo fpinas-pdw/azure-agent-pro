@@ -1,0 +1,359 @@
+name: Bicep Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'docs/workshop/kitten-space-missions/solution/bicep/**'
+      - '.github/workflows/bicep-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write      # Required for OIDC authentication
+  contents: read       # Required for checkout
+  pull-requests: write # Required for commenting on PRs
+  security-events: write # Required for security scanning results
+
+env:
+  BICEP_BASE_PATH: 'docs/workshop/kitten-space-missions/solution/bicep'
+  AZURE_LOCATION: 'westeurope'
+
+jobs:
+  lint:
+    name: Bicep Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bicep CLI
+        run: |
+          az bicep install
+          az bicep version
+
+      - name: Lint Bicep files
+        id: lint
+        continue-on-error: true
+        run: |
+          echo "## 🔍 Bicep Linting Results" > lint-results.md
+          echo "" >> lint-results.md
+          
+          LINT_FAILED=0
+          
+          # Lint main.bicep
+          echo "### Main Template" >> lint-results.md
+          if az bicep build --file ${{ env.BICEP_BASE_PATH }}/main.bicep 2>&1 | tee -a lint-results.md; then
+            echo "✅ main.bicep: No issues" >> lint-results.md
+          else
+            echo "❌ main.bicep: Has issues" >> lint-results.md
+            LINT_FAILED=1
+          fi
+          echo "" >> lint-results.md
+          
+          # Lint all modules
+          echo "### Modules" >> lint-results.md
+          for module in ${{ env.BICEP_BASE_PATH }}/modules/*.bicep; do
+            MODULE_NAME=$(basename "$module")
+            echo "#### $MODULE_NAME" >> lint-results.md
+            if az bicep build --file "$module" 2>&1 | tee -a lint-results.md; then
+              echo "✅ $MODULE_NAME: No issues" >> lint-results.md
+            else
+              echo "❌ $MODULE_NAME: Has issues" >> lint-results.md
+              LINT_FAILED=1
+            fi
+            echo "" >> lint-results.md
+          done
+          
+          echo "lint-failed=$LINT_FAILED" >> $GITHUB_OUTPUT
+
+      - name: Upload lint results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-results
+          path: lint-results.md
+          retention-days: 30
+
+      - name: Fail if linting found issues
+        if: steps.lint.outputs.lint-failed == '1'
+        run: |
+          echo "❌ Linting failed. Please fix the issues above."
+          exit 1
+
+  build:
+    name: Bicep Build
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bicep CLI
+        run: |
+          az bicep install
+          az bicep version
+
+      - name: Build Bicep to ARM template
+        run: |
+          echo "🏗️ Building Bicep templates to ARM JSON..."
+          
+          # Build main template
+          az bicep build \
+            --file ${{ env.BICEP_BASE_PATH }}/main.bicep \
+            --outfile ${{ env.BICEP_BASE_PATH }}/main.json
+          
+          echo "✅ Build successful"
+          
+          # Show ARM template size
+          TEMPLATE_SIZE=$(wc -c < ${{ env.BICEP_BASE_PATH }}/main.json)
+          echo "📦 ARM Template size: $TEMPLATE_SIZE bytes"
+
+      - name: Upload ARM template
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm-template
+          path: ${{ env.BICEP_BASE_PATH }}/main.json
+          retention-days: 30
+
+  security-scan:
+    name: Security Scan (Checkov)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov security scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.BICEP_BASE_PATH }}
+          framework: bicep
+          soft_fail: false
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          download_external_modules: true
+          quiet: false
+
+      - name: Upload Checkov results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      - name: Generate security summary
+        if: always()
+        run: |
+          echo "## 🔒 Security Scan Results (Checkov)" > security-results.md
+          echo "" >> security-results.md
+          
+          if [ "${{ steps.checkov.outcome }}" == "success" ]; then
+            echo "✅ **No security issues found!**" >> security-results.md
+          else
+            echo "⚠️ **Security issues detected. Please review the Security tab.**" >> security-results.md
+          fi
+          echo "" >> security-results.md
+          echo "📊 Full results available in: [Security → Code scanning alerts](../../security/code-scanning)" >> security-results.md
+
+      - name: Upload security results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-results
+          path: |
+            security-results.md
+            checkov-results.sarif
+          retention-days: 30
+
+  what-if:
+    name: Deployment What-If Analysis
+    runs-on: ubuntu-latest
+    needs: [lint, build, security-scan]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run What-If deployment
+        id: whatif
+        continue-on-error: true
+        run: |
+          echo "🔍 Running What-If analysis..."
+          
+          # Run what-if and capture output
+          az deployment sub what-if \
+            --location ${{ env.AZURE_LOCATION }} \
+            --template-file ${{ env.BICEP_BASE_PATH }}/main.bicep \
+            --parameters ${{ env.BICEP_BASE_PATH }}/parameters/dev.parameters.json \
+            --parameters sqlAdminPassword='${{ secrets.SQL_ADMIN_PASSWORD_DEV }}' \
+            --result-format FullResourcePayloads \
+            > whatif-output.txt 2>&1 || true
+          
+          # Extract summary
+          RESOURCES_TO_CREATE=$(grep -oP '\d+(?= to create)' whatif-output.txt || echo "0")
+          RESOURCES_TO_MODIFY=$(grep -oP '\d+(?= to modify)' whatif-output.txt || echo "0")
+          RESOURCES_TO_DELETE=$(grep -oP '\d+(?= to delete)' whatif-output.txt || echo "0")
+          
+          echo "resources-create=$RESOURCES_TO_CREATE" >> $GITHUB_OUTPUT
+          echo "resources-modify=$RESOURCES_TO_MODIFY" >> $GITHUB_OUTPUT
+          echo "resources-delete=$RESOURCES_TO_DELETE" >> $GITHUB_OUTPUT
+
+      - name: Generate What-If summary
+        id: summary
+        run: |
+          echo "## 🔮 Azure Deployment What-If Analysis" > whatif-summary.md
+          echo "" >> whatif-summary.md
+          echo "**Environment:** Dev" >> whatif-summary.md
+          echo "**Location:** ${{ env.AZURE_LOCATION }}" >> whatif-summary.md
+          echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          
+          echo "### 📊 Summary" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          echo "| Action | Count |" >> whatif-summary.md
+          echo "|--------|-------|" >> whatif-summary.md
+          echo "| ➕ Create | ${{ steps.whatif.outputs.resources-create }} |" >> whatif-summary.md
+          echo "| 🔄 Modify | ${{ steps.whatif.outputs.resources-modify }} |" >> whatif-summary.md
+          echo "| ❌ Delete | ${{ steps.whatif.outputs.resources-delete }} |" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          
+          # Add warning if resources will be deleted
+          if [ "${{ steps.whatif.outputs.resources-delete }}" -gt "0" ]; then
+            echo "⚠️ **WARNING:** This deployment will delete ${{ steps.whatif.outputs.resources-delete }} resource(s)!" >> whatif-summary.md
+            echo "" >> whatif-summary.md
+          fi
+          
+          echo "### 📝 Detailed Changes" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          echo "<details>" >> whatif-summary.md
+          echo "<summary>Click to expand full What-If output</summary>" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          echo "\`\`\`" >> whatif-summary.md
+          cat whatif-output.txt >> whatif-summary.md
+          echo "\`\`\`" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          echo "</details>" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          
+          echo "### ✅ Next Steps" >> whatif-summary.md
+          echo "" >> whatif-summary.md
+          echo "- Review the changes above" >> whatif-summary.md
+          echo "- Ensure no unexpected resource deletions" >> whatif-summary.md
+          echo "- Once approved, merge this PR to trigger deployment" >> whatif-summary.md
+
+      - name: Upload What-If results
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatif-results
+          path: |
+            whatif-summary.md
+            whatif-output.txt
+          retention-days: 30
+
+  comment-pr:
+    name: Comment PR with Results
+    runs-on: ubuntu-latest
+    needs: [lint, build, security-scan, what-if]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate PR comment
+        id: generate-comment
+        run: |
+          # Start comment
+          cat > pr-comment.md << 'EOF'
+          # 🚀 Bicep Validation Results
+          
+          EOF
+          
+          # Add job statuses
+          echo "## 📋 Job Status" >> pr-comment.md
+          echo "" >> pr-comment.md
+          echo "| Job | Status |" >> pr-comment.md
+          echo "|-----|--------|" >> pr-comment.md
+          echo "| Linting | ${{ needs.lint.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> pr-comment.md
+          echo "| Build | ${{ needs.build.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> pr-comment.md
+          echo "| Security Scan | ${{ needs.security-scan.result == 'success' && '✅ Passed' || needs.security-scan.result == 'failure' && '⚠️ Issues Found' || '⏭️ Skipped' }} |" >> pr-comment.md
+          echo "| What-If Analysis | ${{ needs.what-if.result == 'success' && '✅ Completed' || '❌ Failed' }} |" >> pr-comment.md
+          echo "" >> pr-comment.md
+          
+          # Add lint results if available
+          if [ -f "artifacts/lint-results/lint-results.md" ]; then
+            cat artifacts/lint-results/lint-results.md >> pr-comment.md
+            echo "" >> pr-comment.md
+          fi
+          
+          # Add security results if available
+          if [ -f "artifacts/security-results/security-results.md" ]; then
+            cat artifacts/security-results/security-results.md >> pr-comment.md
+            echo "" >> pr-comment.md
+          fi
+          
+          # Add what-if results if available
+          if [ -f "artifacts/whatif-results/whatif-summary.md" ]; then
+            cat artifacts/whatif-results/whatif-summary.md >> pr-comment.md
+            echo "" >> pr-comment.md
+          fi
+          
+          # Add footer
+          echo "---" >> pr-comment.md
+          echo "" >> pr-comment.md
+          echo "🤖 *Automated validation by GitHub Actions*" >> pr-comment.md
+          echo "*Run ID: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*" >> pr-comment.md
+
+      - name: Find existing comment
+        uses: peter-evans/find-comment@v3
+        id: find-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: '🚀 Bicep Validation Results'
+
+      - name: Create or update PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: pr-comment.md
+          edit-mode: replace
+
+  validation-summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [lint, build, security-scan, what-if]
+    if: always()
+    steps:
+      - name: Check validation results
+        run: |
+          echo "🔍 Validation Summary"
+          echo "===================="
+          echo ""
+          echo "Linting: ${{ needs.lint.result }}"
+          echo "Build: ${{ needs.build.result }}"
+          echo "Security Scan: ${{ needs.security-scan.result }}"
+          echo "What-If: ${{ needs.what-if.result }}"
+          echo ""
+          
+          # Determine overall status
+          if [[ "${{ needs.lint.result }}" == "success" ]] && \
+             [[ "${{ needs.build.result }}" == "success" ]] && \
+             [[ "${{ needs.security-scan.result }}" == "success" ]]; then
+            echo "✅ All validation checks passed!"
+            exit 0
+          else
+            echo "❌ Some validation checks failed. Please review the logs above."
+            exit 1
+          fi

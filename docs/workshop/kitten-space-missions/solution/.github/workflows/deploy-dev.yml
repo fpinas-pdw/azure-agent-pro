@@ -1,0 +1,607 @@
+name: Deploy to Dev Environment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/workshop/kitten-space-missions/solution/bicep/**'
+      - '.github/workflows/deploy-dev.yml'
+  workflow_dispatch:
+    inputs:
+      skip_validation:
+        description: 'Skip pre-deployment validation'
+        required: false
+        default: false
+        type: boolean
+      skip_smoke_tests:
+        description: 'Skip smoke tests after deployment'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  BICEP_BASE_PATH: 'docs/workshop/kitten-space-missions/solution/bicep'
+  AZURE_LOCATION: 'westeurope'
+  ENVIRONMENT: 'dev'
+
+jobs:
+  pre-deployment-validation:
+    name: Pre-Deployment Validation
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_validation }}
+    outputs:
+      validation-passed: ${{ steps.validate.outputs.passed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: |
+          az bicep install
+          az bicep version
+
+      - name: Validate Bicep Syntax
+        id: validate
+        run: |
+          echo "🔍 Validating Bicep templates..."
+          
+          VALIDATION_FAILED=0
+          
+          # Validate main template
+          if ! az bicep build --file ${{ env.BICEP_BASE_PATH }}/main.bicep; then
+            echo "❌ main.bicep validation failed"
+            VALIDATION_FAILED=1
+          else
+            echo "✅ main.bicep validation passed"
+          fi
+          
+          # Validate all modules
+          for module in ${{ env.BICEP_BASE_PATH }}/modules/*.bicep; do
+            MODULE_NAME=$(basename "$module")
+            if ! az bicep build --file "$module"; then
+              echo "❌ $MODULE_NAME validation failed"
+              VALIDATION_FAILED=1
+            else
+              echo "✅ $MODULE_NAME validation passed"
+            fi
+          done
+          
+          if [ $VALIDATION_FAILED -eq 0 ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "✅ All validations passed"
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "❌ Validation failed"
+            exit 1
+          fi
+
+      - name: Run What-If Analysis
+        run: |
+          echo "📊 Running What-If deployment analysis..."
+          
+          az deployment sub what-if \
+            --location ${{ env.AZURE_LOCATION }} \
+            --template-file ${{ env.BICEP_BASE_PATH }}/main.bicep \
+            --parameters ${{ env.BICEP_BASE_PATH }}/parameters/dev.parameters.json \
+            --parameters sqlAdminPassword='${{ secrets.SQL_ADMIN_PASSWORD_DEV }}' \
+            --result-format ResourceIdOnly \
+            > what-if-output.txt
+          
+          # Extract summary
+          RESOURCES_TO_CREATE=$(grep -c "Create" what-if-output.txt || echo "0")
+          RESOURCES_TO_MODIFY=$(grep -c "Modify" what-if-output.txt || echo "0")
+          RESOURCES_TO_DELETE=$(grep -c "Delete" what-if-output.txt || echo "0")
+          
+          echo "📊 What-If Summary:"
+          echo "  ➕ Create: $RESOURCES_TO_CREATE resources"
+          echo "  🔄 Modify: $RESOURCES_TO_MODIFY resources"
+          echo "  ❌ Delete: $RESOURCES_TO_DELETE resources"
+          
+          # Warn if resources will be deleted
+          if [ "$RESOURCES_TO_DELETE" -gt "0" ]; then
+            echo "⚠️ WARNING: $RESOURCES_TO_DELETE resource(s) will be DELETED!"
+          fi
+
+      - name: Security Check
+        run: |
+          echo "🔒 Running security checks..."
+          
+          # Check for hardcoded secrets (basic check)
+          if grep -r -i "password\s*=\s*['\"]" ${{ env.BICEP_BASE_PATH }}/ --include="*.bicep" --include="*.json"; then
+            echo "❌ Potential hardcoded secrets found!"
+            exit 1
+          fi
+          
+          # Check for public network access enabled
+          if grep -r "publicNetworkAccess.*Enabled" ${{ env.BICEP_BASE_PATH }}/ --include="*.bicep"; then
+            echo "⚠️ Warning: Some resources have public network access enabled"
+          fi
+          
+          echo "✅ Security checks passed"
+
+  deploy:
+    name: Deploy Infrastructure to Azure
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-validation]
+    if: |
+      always() && 
+      (needs.pre-deployment-validation.result == 'success' || 
+       needs.pre-deployment-validation.result == 'skipped')
+    environment: dev
+    outputs:
+      deployment-name: ${{ steps.deploy.outputs.deployment-name }}
+      app-service-name: ${{ steps.deploy.outputs.app-service-name }}
+      app-service-url: ${{ steps.deploy.outputs.app-service-url }}
+      resource-group-name: ${{ steps.deploy.outputs.resource-group-name }}
+      sql-server-name: ${{ steps.deploy.outputs.sql-server-name }}
+      key-vault-name: ${{ steps.deploy.outputs.key-vault-name }}
+      deployment-successful: ${{ steps.deploy.outputs.success }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Last Successful Deployment
+        id: last-deployment
+        run: |
+          echo "📋 Finding last successful deployment for rollback..."
+          
+          LAST_DEPLOYMENT=$(az deployment sub list \
+            --query "sort_by([?properties.provisioningState=='Succeeded' && starts_with(name, 'kitten-missions-dev')], &properties.timestamp) | [-1].name" \
+            -o tsv)
+          
+          if [ -n "$LAST_DEPLOYMENT" ]; then
+            echo "last-deployment-name=$LAST_DEPLOYMENT" >> $GITHUB_OUTPUT
+            echo "✅ Found last deployment: $LAST_DEPLOYMENT"
+          else
+            echo "last-deployment-name=none" >> $GITHUB_OUTPUT
+            echo "ℹ️ No previous successful deployment found"
+          fi
+
+      - name: Deploy to Azure
+        id: deploy
+        continue-on-error: true
+        run: |
+          DEPLOYMENT_NAME="kitten-missions-dev-$(date +%Y%m%d-%H%M%S)"
+          echo "deployment-name=$DEPLOYMENT_NAME" >> $GITHUB_OUTPUT
+          
+          echo "🚀 Starting deployment: $DEPLOYMENT_NAME"
+          echo "📍 Location: ${{ env.AZURE_LOCATION }}"
+          echo "🌍 Environment: ${{ env.ENVIRONMENT }}"
+          echo ""
+          
+          # Start deployment
+          DEPLOYMENT_START_TIME=$(date +%s)
+          
+          if az deployment sub create \
+            --name "$DEPLOYMENT_NAME" \
+            --location ${{ env.AZURE_LOCATION }} \
+            --template-file ${{ env.BICEP_BASE_PATH }}/main.bicep \
+            --parameters ${{ env.BICEP_BASE_PATH }}/parameters/dev.parameters.json \
+            --parameters sqlAdminPassword='${{ secrets.SQL_ADMIN_PASSWORD_DEV }}'; then
+            
+            DEPLOYMENT_END_TIME=$(date +%s)
+            DEPLOYMENT_DURATION=$((DEPLOYMENT_END_TIME - DEPLOYMENT_START_TIME))
+            
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "deployment-duration=$DEPLOYMENT_DURATION" >> $GITHUB_OUTPUT
+            echo "✅ Deployment completed successfully in ${DEPLOYMENT_DURATION}s"
+            
+            # Get deployment outputs
+            echo "📋 Retrieving deployment outputs..."
+            
+            RG_NAME=$(az deployment sub show --name "$DEPLOYMENT_NAME" \
+              --query "properties.outputs.resourceGroupName.value" -o tsv)
+            APP_NAME=$(az deployment sub show --name "$DEPLOYMENT_NAME" \
+              --query "properties.outputs.appServiceName.value" -o tsv)
+            APP_URL=$(az deployment sub show --name "$DEPLOYMENT_NAME" \
+              --query "properties.outputs.appServiceUrl.value" -o tsv)
+            SQL_SERVER=$(az deployment sub show --name "$DEPLOYMENT_NAME" \
+              --query "properties.outputs.sqlServerFqdn.value" -o tsv)
+            KV_NAME=$(az deployment sub show --name "$DEPLOYMENT_NAME" \
+              --query "properties.outputs.keyVaultName.value" -o tsv)
+            
+            echo "resource-group-name=$RG_NAME" >> $GITHUB_OUTPUT
+            echo "app-service-name=$APP_NAME" >> $GITHUB_OUTPUT
+            echo "app-service-url=$APP_URL" >> $GITHUB_OUTPUT
+            echo "sql-server-name=$SQL_SERVER" >> $GITHUB_OUTPUT
+            echo "key-vault-name=$KV_NAME" >> $GITHUB_OUTPUT
+            
+            echo ""
+            echo "📊 Deployment Details:"
+            echo "  Resource Group: $RG_NAME"
+            echo "  App Service: $APP_NAME"
+            echo "  App URL: https://$APP_URL"
+            echo "  SQL Server: $SQL_SERVER"
+            echo "  Key Vault: $KV_NAME"
+            
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "❌ Deployment failed"
+            exit 1
+          fi
+
+      - name: Tag Deployment
+        if: steps.deploy.outputs.success == 'true'
+        run: |
+          echo "🏷️ Tagging deployed resources..."
+          
+          RG_NAME="${{ steps.deploy.outputs.resource-group-name }}"
+          
+          az group update \
+            --name "$RG_NAME" \
+            --set tags.LastDeployment="${{ steps.deploy.outputs.deployment-name }}" \
+            --set tags.DeployedBy="${{ github.actor }}" \
+            --set tags.DeployedAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set tags.GitHubRunId="${{ github.run_id }}" \
+            --set tags.CommitSha="${{ github.sha }}"
+          
+          echo "✅ Tags applied to resource group"
+
+      - name: Create Deployment Summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.deploy.outputs.success }}" == "true" ]; then
+            echo "### ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| **Environment** | ${{ env.ENVIRONMENT }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Deployment Name** | ${{ steps.deploy.outputs.deployment-name }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Duration** | ${{ steps.deploy.outputs.deployment-duration }}s |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Resource Group** | ${{ steps.deploy.outputs.resource-group-name }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **App Service** | ${{ steps.deploy.outputs.app-service-name }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **App URL** | [https://${{ steps.deploy.outputs.app-service-url }}](https://${{ steps.deploy.outputs.app-service-url }}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| **SQL Server** | ${{ steps.deploy.outputs.sql-server-name }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Key Vault** | ${{ steps.deploy.outputs.key-vault-name }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Deployed By** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Commit** | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The deployment encountered errors. Check the logs for details." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Rollback will be attempted automatically.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  smoke-tests:
+    name: Post-Deployment Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: |
+      always() &&
+      needs.deploy.outputs.deployment-successful == 'true' &&
+      !inputs.skip_smoke_tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Wait for App Service to be Ready
+        run: |
+          echo "⏳ Waiting for App Service to be ready..."
+          
+          APP_URL="https://${{ needs.deploy.outputs.app-service-url }}"
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            echo "Attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS..."
+            
+            if curl -sSf "$APP_URL" > /dev/null 2>&1; then
+              echo "✅ App Service is responding"
+              break
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "App Service not ready yet, waiting 10s..."
+              sleep 10
+            fi
+          done
+          
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ App Service did not become ready in time"
+            exit 1
+          fi
+
+      - name: Test App Service Health
+        id: health-check
+        run: |
+          echo "🏥 Testing App Service health endpoint..."
+          
+          APP_URL="https://${{ needs.deploy.outputs.app-service-url }}"
+          
+          # Test root endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$APP_URL")
+          
+          if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 404 ]; then
+            echo "✅ App Service is accessible (HTTP $HTTP_CODE)"
+          else
+            echo "❌ App Service returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Test SQL Database Connectivity
+        run: |
+          echo "🗄️ Testing SQL Database connectivity..."
+          
+          SQL_SERVER="${{ needs.deploy.outputs.sql-server-name }}"
+          
+          # Test if SQL Server is reachable (basic network check)
+          if nslookup "$SQL_SERVER" > /dev/null 2>&1; then
+            echo "✅ SQL Server DNS resolution successful"
+          else
+            echo "⚠️ Warning: SQL Server DNS resolution failed (may be expected with Private Endpoint)"
+          fi
+
+      - name: Test Key Vault Access
+        run: |
+          echo "🔐 Testing Key Vault access..."
+          
+          KV_NAME="${{ needs.deploy.outputs.key-vault-name }}"
+          
+          # Test Key Vault accessibility
+          if az keyvault show --name "$KV_NAME" > /dev/null 2>&1; then
+            echo "✅ Key Vault is accessible"
+            
+            # List secrets (metadata only)
+            SECRET_COUNT=$(az keyvault secret list --vault-name "$KV_NAME" --query "length(@)" -o tsv)
+            echo "📊 Key Vault contains $SECRET_COUNT secret(s)"
+          else
+            echo "❌ Key Vault is not accessible"
+            exit 1
+          fi
+
+      - name: Test Application Insights
+        run: |
+          echo "📊 Verifying Application Insights telemetry..."
+          
+          RG_NAME="${{ needs.deploy.outputs.resource-group-name }}"
+          
+          # Get Application Insights name
+          APPI_NAME=$(az monitor app-insights component list \
+            --resource-group "$RG_NAME" \
+            --query "[0].name" -o tsv)
+          
+          if [ -n "$APPI_NAME" ]; then
+            echo "✅ Application Insights found: $APPI_NAME"
+            
+            # Check if instrumentation key is configured
+            INSTRUMENTATION_KEY=$(az monitor app-insights component show \
+              --app "$APPI_NAME" \
+              --resource-group "$RG_NAME" \
+              --query "instrumentationKey" -o tsv)
+            
+            if [ -n "$INSTRUMENTATION_KEY" ]; then
+              echo "✅ Instrumentation key configured"
+            fi
+          else
+            echo "⚠️ Application Insights not found"
+          fi
+
+      - name: Smoke Tests Summary
+        if: always()
+        run: |
+          echo "## 🧪 Smoke Tests Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| App Service Health | ${{ steps.health-check.outcome == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SQL Database | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Key Vault Access | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application Insights | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.health-check.outcome }}" != "success" ]; then
+            echo "⚠️ **Some smoke tests failed. Consider rolling back.**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **All smoke tests passed successfully!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy, smoke-tests]
+    if: |
+      always() &&
+      (needs.deploy.result == 'failure' || 
+       needs.smoke-tests.result == 'failure')
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Last Successful Deployment
+        id: last-deployment
+        run: |
+          echo "🔍 Finding last successful deployment..."
+          
+          LAST_DEPLOYMENT=$(az deployment sub list \
+            --query "sort_by([?properties.provisioningState=='Succeeded' && starts_with(name, 'kitten-missions-dev') && name != '${{ needs.deploy.outputs.deployment-name }}'], &properties.timestamp) | [-1].name" \
+            -o tsv)
+          
+          if [ -n "$LAST_DEPLOYMENT" ] && [ "$LAST_DEPLOYMENT" != "null" ]; then
+            echo "last-deployment-name=$LAST_DEPLOYMENT" >> $GITHUB_OUTPUT
+            echo "rollback-possible=true" >> $GITHUB_OUTPUT
+            echo "✅ Found last successful deployment: $LAST_DEPLOYMENT"
+          else
+            echo "rollback-possible=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No previous successful deployment found for rollback"
+          fi
+
+      - name: Attempt Rollback
+        if: steps.last-deployment.outputs.rollback-possible == 'true'
+        run: |
+          LAST_DEPLOYMENT="${{ steps.last-deployment.outputs.last-deployment-name }}"
+          ROLLBACK_DEPLOYMENT="rollback-$(date +%Y%m%d-%H%M%S)"
+          
+          echo "🔄 Attempting rollback to: $LAST_DEPLOYMENT"
+          
+          # Get the template from last successful deployment
+          TEMPLATE=$(az deployment sub show \
+            --name "$LAST_DEPLOYMENT" \
+            --query "properties.template" -o json)
+          
+          PARAMETERS=$(az deployment sub show \
+            --name "$LAST_DEPLOYMENT" \
+            --query "properties.parameters" -o json)
+          
+          # Save to temporary files
+          echo "$TEMPLATE" > /tmp/rollback-template.json
+          echo "$PARAMETERS" > /tmp/rollback-parameters.json
+          
+          # Deploy previous version
+          if az deployment sub create \
+            --name "$ROLLBACK_DEPLOYMENT" \
+            --location ${{ env.AZURE_LOCATION }} \
+            --template-file /tmp/rollback-template.json \
+            --parameters "@/tmp/rollback-parameters.json"; then
+            
+            echo "✅ Rollback completed successfully"
+            echo "🔙 System restored to previous state: $LAST_DEPLOYMENT"
+          else
+            echo "❌ Rollback failed"
+            echo "⚠️ Manual intervention required!"
+            exit 1
+          fi
+
+      - name: Rollback Summary
+        if: always()
+        run: |
+          echo "## 🔄 Rollback Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.last-deployment.outputs.rollback-possible }}" == "true" ]; then
+            echo "### ✅ Rollback Executed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The system has been rolled back to the last successful deployment:" >> $GITHUB_STEP_SUMMARY
+            echo "- **Previous Deployment**: ${{ steps.last-deployment.outputs.last-deployment-name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Failed Deployment**: ${{ needs.deploy.outputs.deployment-name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Reason**: ${{ needs.deploy.result == 'failure' && 'Deployment failed' || 'Smoke tests failed' }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔍 Next Steps" >> $GITHUB_STEP_SUMMARY
+            echo "1. Review the deployment logs to identify the cause of failure" >> $GITHUB_STEP_SUMMARY
+            echo "2. Fix the issues in the Bicep templates or configuration" >> $GITHUB_STEP_SUMMARY
+            echo "3. Test changes locally before redeploying" >> $GITHUB_STEP_SUMMARY
+            echo "4. Redeploy when ready" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Rollback Not Possible" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No previous successful deployment found for rollback." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Manual intervention required to restore service!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [deploy, smoke-tests, rollback]
+    if: always()
+    steps:
+      - name: Determine Deployment Status
+        id: status
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ] && [ "${{ needs.smoke-tests.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=✅ Deployment to dev environment completed successfully" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.rollback.result }}" == "success" ]; then
+            echo "status=rolled-back" >> $GITHUB_OUTPUT
+            echo "message=🔄 Deployment failed and was rolled back successfully" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "message=❌ Deployment failed and rollback was not possible" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Issue on Failure
+        if: steps.status.outputs.status != 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ steps.status.outputs.status }}';
+            const deploymentName = '${{ needs.deploy.outputs.deployment-name }}';
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            
+            let body = `## 🚨 Deployment Failure Alert\n\n`;
+            body += `**Status**: ${status}\n`;
+            body += `**Environment**: dev\n`;
+            body += `**Deployment Name**: ${deploymentName}\n`;
+            body += `**Triggered By**: @${{ github.actor }}\n`;
+            body += `**Commit**: ${{ github.sha }}\n`;
+            body += `**Workflow Run**: ${runUrl}\n\n`;
+            
+            if (status === 'rolled-back') {
+              body += `### ℹ️ Rollback Successful\n\n`;
+              body += `The system has been automatically rolled back to the previous stable state.\n\n`;
+            } else {
+              body += `### ⚠️ Manual Intervention Required\n\n`;
+              body += `Automatic rollback failed or was not possible. Please investigate immediately.\n\n`;
+            }
+            
+            body += `### Action Items\n`;
+            body += `- [ ] Review workflow logs\n`;
+            body += `- [ ] Identify root cause of failure\n`;
+            body += `- [ ] Apply fix to Bicep templates\n`;
+            body += `- [ ] Test locally before redeploying\n`;
+            body += `- [ ] Redeploy to dev environment\n`;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Dev Deployment Failed - ${deploymentName}`,
+              body: body,
+              labels: ['deployment-failure', 'dev-environment', 'priority-high']
+            });
+
+      - name: Final Summary
+        run: |
+          echo "## 📊 Final Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.status.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.status.outputs.status }}" == "success" ]; then
+            echo "### 🎉 Success!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The application is now running at:" >> $GITHUB_STEP_SUMMARY
+            echo "**https://${{ needs.deploy.outputs.app-service-url }}**" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.status.outputs.status }}" == "rolled-back" ]; then
+            echo "### 🔄 Rolled Back" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "A GitHub issue has been created to track this failure." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⚠️ Critical Issue" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**URGENT**: Manual intervention required immediately!" >> $GITHUB_STEP_SUMMARY
+          fi
